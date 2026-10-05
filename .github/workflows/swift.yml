@@ -1,0 +1,96 @@
+name: Build Erosion IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Make build scripts executable
+        run: |
+          chmod +x ./build-airlift-ffi.sh
+          chmod +x ./ipabuild.sh
+
+      - name: Verify source layout
+        run: |
+          test -f AirCard-iOS-main/rust-core/src/exploit.rs
+          test -f Erosion.xcodeproj/project.pbxproj
+          test -f Erosion/Experimental/Airlift/AirliftBridge.swift
+          test -f External/AirliftFFI.xcframework/ios-arm64/libairlift_ffi.a
+
+      - name: Rebuild AirliftFFI
+        run: |
+          ./build-airlift-ffi.sh
+          echo "=== AirliftFFI verification ==="
+          ls -lh External/AirliftFFI.xcframework/ios-arm64/libairlift_ffi.a
+          if strings External/AirliftFFI.xcframework/ios-arm64/libairlift_ffi.a | grep -Fq 'restore completed by AirTraffic'; then
+            echo "[OK] New Airlift read implementation is present in the linked XCFramework."
+          else
+            echo "[ERROR] External/AirliftFFI.xcframework still does not contain the new Airlift read implementation."
+            exit 1
+          fi
+          if strings External/AirliftFFI.xcframework/ios-arm64/libairlift_ffi.a | grep -Fq 'SAFETY STOP — restore verification failed'; then
+            echo "[ERROR] Old restore-verification implementation is still present in the linked XCFramework."
+            exit 1
+          fi
+
+      - name: Clean Xcode build state
+        run: |
+          rm -rf build
+          rm -rf "$HOME/Library/Developer/Xcode/DerivedData/Erosion-*"
+          xcodebuild -project Erosion.xcodeproj -scheme Erosion -configuration Release -showBuildSettings >/dev/null
+
+      - name: Build IPA
+        run: ./ipabuild.sh
+
+      - name: Verify IPA contains new Airlift code
+        run: |
+          IPA="$(find . -type f -name '*.ipa' -print -quit)"
+          test -n "$IPA"
+          rm -rf /tmp/erosion-ipa-verify
+          mkdir -p /tmp/erosion-ipa-verify
+          unzip -q "$IPA" -d /tmp/erosion-ipa-verify
+          APP="/tmp/erosion-ipa-verify/Payload/Erosion.app/Erosion"
+          test -f "$APP"
+          if strings "$APP" | grep -Fq 'restore completed by AirTraffic'; then
+            echo "[OK] Final IPA contains the new Airlift read implementation."
+          else
+            echo "[ERROR] Final IPA does not contain the new Airlift read implementation."
+            exit 1
+          fi
+          if strings "$APP" | grep -Fq 'SAFETY STOP — restore verification failed'; then
+            echo "[ERROR] Final IPA still contains the old restore-verification failure path."
+            exit 1
+          fi
+
+      - name: Find IPA
+        run: |
+          echo "=== IPA FILES ==="
+          find . -type f -name "*.ipa" -print
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Erosion-IPA
+          path: "**/*.ipa"
+          if-no-files-found: error
+          retention-days: 7
