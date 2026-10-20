@@ -10,6 +10,7 @@ struct AirliftView: View {
     @State private var tunnelIP: String? = NetworkStatus.tunnelIP()
     @State private var deviceIP: String? = NetworkStatus.deviceIP()
     @State private var pairedTick = 0
+    @State private var lastKnownPairingPresence = false
     @State private var showPairingImporter = false
     @State private var showPairingInstructions = false
     @State private var showAirliftNote = false
@@ -67,13 +68,8 @@ struct AirliftView: View {
                         Label("Clear /tmp", systemImage: "trash")
                     }
 
-                    if isPairing {
-                        Button(role: .destructive) {
-                            airlift.cancelPairing()
-                            pairedTick &+= 1
-                        } label: {
-                            Label("Cancel Pairing", systemImage: "xmark.circle")
-                        }
+                    AirliftCancelPairingMenuItem {
+                        airlift.cancelPairing()
                     }
                 } label: {
                     Image(systemName: "ellipsis")
@@ -92,13 +88,12 @@ struct AirliftView: View {
                     .tint(.primary)
                     .accessibilityLabel("Airlift note")
                 } else {
-                    Button(pairButtonTitle, role: .adaptiveConfirm) {
-                        if !isPairing {
+                    AirliftPairingToolbarButton {
+                        if !PairingController.shared.running && !airlift.hasPairing() {
                             airlift.runPairing()
                         }
                         showPairingInstructions = true
                     }
-                    .disabled(isPairing && livePairPIN == nil)
                 }
             }
         }
@@ -118,12 +113,12 @@ struct AirliftView: View {
             Text("Go to Settings —> Privacy & Security —> Developer Mode —> Pair with Erosion")
         }
         .onAppear {
+            lastKnownPairingPresence = airlift.hasPairing()
             refresh()
             pairedTick &+= 1
             airlift.autoScanContainerDiagnosticsOnEntry()
         }
         .onReceive(ticker) { _ in refresh() }
-        .onChange(of: airlift.state) { _, _ in pairedTick &+= 1 }
         .refreshable { refresh(); pairedTick &+= 1 }
         .sheet(isPresented: $airlift.showReadView) {
             NavigationStack {
@@ -157,7 +152,7 @@ struct AirliftView: View {
             case .success(let urls):
                 if let url = urls.first {
                     airlift.importPairingFile(from: url)
-                    pairedTick &+= 1
+                    refreshPairingPresence()
                 }
             case .failure(let error):
                 airlift.importPairingFileError(error)
@@ -172,21 +167,18 @@ struct AirliftView: View {
             } label: {
                 HStack {
                     Text("Import Pairing")
-                        .foregroundStyle(isPaired ? Color.secondary : Color.orange)
+                        .foregroundStyle(Color.orange)
                     Spacer()
-                    if isPaired {
-                        Image(systemName: "checkmark")
-                            .foregroundStyle(.green)
-                    }
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .tint(.orange)
             .disabled(isPaired)
 
             Button(role: .destructive) {
                 airlift.deletePairing()
-                pairedTick &+= 1
+                refreshPairingPresence()
             } label: {
                 Text("Delete Pairing")
             }
@@ -254,7 +246,7 @@ struct AirliftView: View {
             } label: {
                 Text("Run Exploit")
             }
-            .disabled(airlift.state == .running || !loopbackVPNUp || !isPaired)
+            .disabled(airlift.exploitRunning || !loopbackVPNUp || !isPaired)
 
             Button {
                 if airlift.readKind == .file {
@@ -369,7 +361,7 @@ struct AirliftView: View {
     }
 
     private var temporaryWorkInProgress: Bool {
-        if case .running = airlift.state { return true }
+        if airlift.exploitRunning { return true }
         return airlift.readRunning
             || airlift.passcodeFlashRunning
             || airlift.containerScansRunning
@@ -407,18 +399,24 @@ struct AirliftView: View {
     }
 
     private func preparePairingExport() async {
-        // Pairing may have just completed while SwiftUI is still rendering the old
-        // toolbar state. Retry briefly before telling the user that no file exists.
-        var sourcePath: String?
-        for attempt in 0..<10 {
-            sourcePath = pairingExportSourcePath()
-            if sourcePath != nil { break }
-            if attempt < 9 {
-                try? await Task.sleep(nanoseconds: 200_000_000)
+        // Pairing may be completed just before the file is atomically committed.
+        // Export bytes through PairingController so a successful pairing/import can
+        // be exported from its validated in-memory snapshot without a second lookup.
+        var data: Data?
+        var preferredPaths: [String] = []
+        if case let .ready(pairingPath) = airlift.state {
+            preferredPaths.append(pairingPath)
+        }
+
+        for attempt in 0..<50 {
+            data = PairingController.pairingDataForExport(preferredPaths: preferredPaths)
+            if let found = data, !found.isEmpty { break }
+            if attempt < 49 {
+                try? await Task.sleep(nanoseconds: 100_000_000)
             }
         }
 
-        guard let sourcePath else {
+        guard let data, !data.isEmpty else {
             Alertinator.shared.alert(
                 title: "Export Pairing unavailable",
                 body: "Erosion does not currently have a readable pairing file. Import or create a pairing first."
@@ -427,11 +425,6 @@ struct AirliftView: View {
         }
 
         do {
-            let data = try Data(contentsOf: URL(fileURLWithPath: sourcePath))
-            guard !data.isEmpty else {
-                Alertinator.shared.alert(title: "Export Pairing failed", body: "The pairing file is empty.")
-                return
-            }
             let exportDirectory = FileManager.default.temporaryDirectory
                 .appendingPathComponent("erosion-pairing-export-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: exportDirectory, withIntermediateDirectories: true)
@@ -447,37 +440,6 @@ struct AirliftView: View {
         }
     }
 
-    private func pairingExportSourcePath() -> String? {
-        let fm = FileManager.default
-        let documents = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        var candidates: [String] = []
-
-        if case let .ready(pairingPath) = airlift.state {
-            candidates.append(pairingPath)
-        }
-        if let custom = PairingController.customPairingFilePath {
-            candidates.append(custom)
-        }
-        candidates.append(PairingController.pairingFilePath())
-        candidates.append(documents.appendingPathComponent("erosion_pairing.plist").path)
-        if let names = try? fm.contentsOfDirectory(atPath: documents.path) {
-            candidates.append(contentsOf: names
-                .filter { $0.hasSuffix(".plist") || $0.hasSuffix(".mobilepairing") || $0.hasSuffix(".mobilepair") }
-                .map { documents.appendingPathComponent($0).path })
-        }
-
-        var seen = Set<String>()
-        for path in candidates where seen.insert(path).inserted {
-            guard fm.fileExists(atPath: path) else { continue }
-            let size = (try? fm.attributesOfItem(atPath: path)[.size] as? Int) ?? 0
-            guard size > 0 else { continue }
-            if let data = try? Data(contentsOf: URL(fileURLWithPath: path)), !data.isEmpty {
-                return path
-            }
-        }
-        return nil
-    }
-
     private func cleanupPairingExport() {
         if let pairingExportURL {
             let exportDirectory = pairingExportURL.deletingLastPathComponent()
@@ -486,7 +448,15 @@ struct AirliftView: View {
         pairingExportURL = nil
     }
 
+    private func refreshPairingPresence() {
+        let current = airlift.hasPairing()
+        guard current != lastKnownPairingPresence else { return }
+        lastKnownPairingPresence = current
+        pairedTick &+= 1
+    }
+
     private func refresh() {
+        refreshPairingPresence()
         let vpn = NetworkStatus.loopbackVPNUp()
         let tun = NetworkStatus.tunnelIP()
         let dev = NetworkStatus.deviceIP()
@@ -501,23 +471,6 @@ struct AirliftView: View {
         return airlift.hasPairing()
     }
 
-    private var isPairing: Bool {
-        if case .pairing = airlift.state { return true }
-        return false
-    }
-
-    private var livePairPIN: String? {
-        // Read the controller directly as a fallback: the bridge mirrors its PIN
-        // asynchronously, and can otherwise miss the brief update between polls.
-        return PairingController.shared.pairingPIN ?? airlift.pairPIN
-    }
-
-    private var pairButtonTitle: String {
-        if isPairing {
-            return livePairPIN ?? "Pairing…"
-        }
-        return "Pair"
-    }
 
 }
 
@@ -778,4 +731,43 @@ private struct AirliftActivitySheet: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) { }
+}
+
+
+/// Observes only the pairing controller, so PIN/status transitions don't invalidate AirliftView's List.
+private struct AirliftPairingToolbarButton: View {
+    @ObservedObject private var controller = PairingController.shared
+    let action: () -> Void
+
+    private var title: String {
+        // Keep the action visually silent while preparation runs; show only the
+        // actual PIN once it is available, in the same fixed-width orange control.
+        controller.pairingPIN ?? "Pair"
+    }
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .foregroundStyle(Color.orange)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+                .frame(width: 72, alignment: .center)
+        }
+        .tint(.orange)
+        .allowsHitTesting(!(controller.running && controller.pairingPIN == nil))
+    }
+}
+
+private struct AirliftCancelPairingMenuItem: View {
+    @ObservedObject private var controller = PairingController.shared
+    let action: () -> Void
+
+    @ViewBuilder
+    var body: some View {
+        if controller.running {
+            Button(role: .destructive, action: action) {
+                Label("Cancel Pairing", systemImage: "xmark.circle")
+            }
+        }
+    }
 }

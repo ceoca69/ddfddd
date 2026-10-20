@@ -184,25 +184,21 @@ struct ExperimentalPasscodeView: View {
         let allDigits = digits.flatMap { $0 }
         return LazyVGrid(
             columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3),
+            alignment: .center,
             spacing: 16
         ) {
             ForEach(Array(allDigits.enumerated()), id: \.offset) { _, digit in
                 if digit.isEmpty {
                     Color.clear
-                        .frame(maxWidth: .infinity)
-                        .aspectRatio(1, contentMode: .fit)
+                        .frame(width: 80, height: 80)
                 } else {
                     Button {
                         selectedDigit = digit
                         showImagePicker = true
                     } label: {
-                        GeometryReader { geometry in
-                            let diameter = min(geometry.size.width, geometry.size.height)
-                            keypadKeyLabel(for: digit, diameter: diameter)
-                                .frame(width: diameter, height: diameter)
-                        }
+                        keypadKeyLabel(for: digit)
                     }
-                    .frame(maxWidth: .infinity)
+                    .frame(width: 80, height: 80)
                     .aspectRatio(1, contentMode: .fit)
                     .buttonStyle(.plain)
                     .accessibilityLabel("Choose artwork for key \(digit)")
@@ -215,10 +211,9 @@ struct ExperimentalPasscodeView: View {
     }
 
     @ViewBuilder
-    private func keypadKeyLabel(for digit: String, diameter: CGFloat) -> some View {
+    private func keypadKeyLabel(for digit: String) -> some View {
         if let image = previewImage(for: digit) {
-            // Preserve the existing artwork scaling while sizing its circular key
-            // background to the actual grid cell instead of a fixed 78-point circle.
+            // Match Dialer Themer's original 80-point key and artwork scaling.
             let denoVal: Float = isPad() ? 2.1 : 3.0
             Image(uiImage: image)
                 .resizable()
@@ -230,22 +225,20 @@ struct ExperimentalPasscodeView: View {
                     Circle()
                         .fill(Color.clear)
                         .glassEffect(.clear, in: .circle)
-                        .frame(width: diameter - 2, height: diameter - 2)
+                        .frame(width: 78, height: 78)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .contentShape(Circle())
         } else {
             let keypadID = KeypadID.allCases.first { $0.dialerNumber == digit }
-            VStack(spacing: max(1, diameter * 0.012)) {
+            VStack(spacing: 1) {
                 Text(digit)
-                    .font(.system(size: diameter * 0.435, weight: .regular))
+                    .font(.system(size: 34, weight: .regular))
                 if let letters = keypadID?.dialerLetters, !letters.isEmpty {
                     Text(letters)
-                        .font(.system(size: diameter * 0.141, weight: .medium))
-                        .tracking(diameter * 0.019)
+                        .font(.system(size: 11, weight: .medium))
+                        .tracking(1.5)
                 }
             }
-            .frame(width: diameter - 2, height: diameter - 2)
+            .frame(width: 78, height: 78)
             .aspectRatio(1, contentMode: .fit)
             .foregroundStyle(Color(.label))
             .glassEffect(.clear.interactive(), in: .circle)

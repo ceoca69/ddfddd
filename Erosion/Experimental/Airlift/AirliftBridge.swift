@@ -60,9 +60,11 @@ final class AirliftBridge: ObservableObject, @unchecked Sendable {
     static let shared = AirliftBridge()
     enum State: Equatable { case idle, pairing, ready(pairingPath: String), running, done(ok: Bool, message: String) }
 
-    @Published private(set) var state: State = .idle
-    @Published private(set) var pairPIN: String? = nil
-    @Published private(set) var pairingStatus: String = ""
+    // Internal state is intentionally not Published: pairing state/PIN polling must
+    // not trigger a redraw of the entire Airlift List. The Pair toolbar observes
+    // PairingController directly, while exploit progress has its own Published flag.
+    private(set) var state: State = .idle
+    @Published private(set) var exploitRunning: Bool = false
     @Published private(set) var exploitLog: [String] = []
     @Published private(set) var installedAppContainers: [AirliftAppContainer] = []
     @Published private(set) var installedAppGroups: [AirliftAppGroup] = []
@@ -283,20 +285,19 @@ final class AirliftBridge: ObservableObject, @unchecked Sendable {
         let p = pairingFilePath()
         guard FileManager.default.fileExists(atPath: p) else { return false }
         let size = (try? FileManager.default.attributesOfItem(atPath: p)[.size] as? Int) ?? 0
-        return size > 0
+        guard size > 0 else { return false }
+        PairingController.cachePairingDataIfNeeded(at: p)
+        return true
     }
 
     func importPairingFileError(_ error: Error) {
         appendLog("[pairing] ❌ Import cancelled/failed: \(error.localizedDescription)")
-        pairingStatus = "Import failed"
     }
 
     func importPairingFile(from url: URL) {
         do {
             let path = try PairingController.importPairingFile(from: url)
             state = .ready(pairingPath: path)
-            pairingStatus = "Imported and validated"
-            pairPIN = nil
             appScanHasRunForPairing = false
             let localDevReady = NetworkStatus.loopbackVPNUp()
             if isAirliftCompatibilityMode() && localDevReady {
@@ -309,41 +310,27 @@ final class AirliftBridge: ObservableObject, @unchecked Sendable {
             }
         } catch {
             appendLog("[pairing] ❌ \(error.localizedDescription)")
-            pairingStatus = "Invalid pairing file"
         }
     }
 
     func runPairing() {
         guard !hasPairing() else { state = .ready(pairingPath: pairingFilePath()); return }
-        state = .pairing; pairingStatus = "Starting host..."; pairPIN = nil
+        state = .pairing
         let ctrl = PairingController.shared
         Task {
             do {
                 let path = try await ctrl.startAndWait()
                 self.state = .ready(pairingPath: path)
-                self.pairingStatus = "Paired"; self.pairPIN = nil
             } catch is CancellationError {
-                self.state = .idle; self.pairingStatus = "Cancelled"
+                self.state = .idle
             } catch {
                 self.state = .idle
-                self.pairingStatus = "Failed: \(error.localizedDescription)"
-            }
-        }
-        Task {
-            // PairingController exposes the PIN as a plain property. Poll only to
-            // detect the PIN transition; do not mirror its status string into this
-            // ObservableObject every cycle, because that invalidates AirliftView's
-            // entire body while its toolbar menu is open.
-            while case .pairing = self.state {
-                try? await Task.sleep(nanoseconds: 200_000_000)
-                let nextPIN = ctrl.pairingPIN
-                if self.pairPIN != nextPIN { self.pairPIN = nextPIN }
             }
         }
     }
     func cancelPairing() {
         PairingController.shared.softCancel()
-        state = .idle; pairingStatus = ""; pairPIN = nil
+        state = .idle
     }
     func deletePairing() {
         let fm = FileManager.default
@@ -366,17 +353,19 @@ final class AirliftBridge: ObservableObject, @unchecked Sendable {
         appScanHasRunForPairing = false
         installedAppContainers = []
         appScanLog = []
-        state = .idle; pairingStatus = ""; pairPIN = nil
+        state = .idle
+        PairingController.clearCachedPairingData()
     }
     func runExploit() {
         let pairingPath = pairingFilePath()
         guard FileManager.default.fileExists(atPath: pairingPath) else {
             state = .done(ok: false, message: "No pairing file"); return
         }
-        state = .running; loggedLines.removeAll(); exploitLog = []
+        state = .running; exploitRunning = true; loggedLines.removeAll(); exploitLog = []
         let targetPath = readTarget.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !targetPath.isEmpty else {
             state = .done(ok: false, message: "Enter a Target path")
+            exploitRunning = false
             appendLog("[exploit] blocked: Target path is empty")
             return
         }
@@ -397,10 +386,12 @@ final class AirliftBridge: ObservableObject, @unchecked Sendable {
                     let msg = jsonStr ?? "OK"
                     self.appendLog("[exploit] ok: \(msg)")
                     self.state = .done(ok: true, message: msg)
+                    self.exploitRunning = false
                 } else {
                     let msg = errStr ?? "rc=\(rc)"
                     self.appendLog("[exploit] fail: \(msg)")
                     self.state = .done(ok: false, message: msg)
+                    self.exploitRunning = false
                 }
             }
         }
@@ -1995,6 +1986,7 @@ final class AirliftBridge: ObservableObject, @unchecked Sendable {
     func cancelExploit() { /* natsuk1-cancel-v1 */
         appendLog("[exploit] cancel requested")
         state = .done(ok: false, message: "cancelled")
+        exploitRunning = false
     }
 
 }

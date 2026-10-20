@@ -16,9 +16,14 @@ final class PairingController: ObservableObject, @unchecked Sendable {
     private let localNetwork = LocalNetworkAuthorization()
     private let keepAlive = KeepAlive()
 
-    private(set) var running = false
+    // Publish only the two values rendered by the isolated Pair toolbar control.
+    // Pairing status text remains internal and does not invalidate the main List.
+    @Published private(set) var running = false
     var pairingStatus: String = "idle"
-    var pairingPIN: String? = nil
+    @Published private(set) var pairingPIN: String? = nil
+
+    private static let pairingDataLock = NSLock()
+    nonisolated(unsafe) private static var cachedPairingData: Data? = nil
 
     /// Path to the pairing file that was actively found or created.
     nonisolated(unsafe) static var customPairingFilePath: String? = nil
@@ -104,6 +109,7 @@ final class PairingController: ObservableObject, @unchecked Sendable {
         }
 
         customPairingFilePath = canonicalURL.path
+        rememberPairingData(data)
         return canonicalURL.path
     }
 
@@ -114,6 +120,7 @@ final class PairingController: ObservableObject, @unchecked Sendable {
         let dir = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let canonicalURL = dir.appendingPathComponent("erosion_pairing.plist")
         if let data = try? Data(contentsOf: URL(fileURLWithPath: sourcePath)), !data.isEmpty {
+            rememberPairingData(data)
             if sourcePath != canonicalURL.path {
                 try? data.write(to: canonicalURL, options: .atomic)
                 try? fm.removeItem(atPath: sourcePath)
@@ -140,13 +147,95 @@ final class PairingController: ObservableObject, @unchecked Sendable {
         let canonical = dir.appendingPathComponent("erosion_pairing.plist").path
         if fm.fileExists(atPath: canonical) {
             let size = (try? fm.attributesOfItem(atPath: canonical)[.size] as? Int) ?? 0
-            if size > 0 { return canonical }
+            if size > 0 {
+                cachePairingDataIfNeeded(at: canonical)
+                return canonical
+            }
         }
         if let custom = customPairingFilePath, fm.fileExists(atPath: custom) {
             let size = (try? fm.attributesOfItem(atPath: custom)[.size] as? Int) ?? 0
             if size > 0 { return syncCanonicalPairingFile(from: custom) }
         }
         return canonical
+    }
+
+    private static func pairingDataIsValid(_ data: Data) -> Bool {
+        guard let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+              let dict = plist as? [String: Any],
+              let publicKey = dict["public_key"] as? Data, publicKey.count == 32,
+              let privateKey = dict["private_key"] as? Data, privateKey.count == 32,
+              let identifier = dict["identifier"] as? String,
+              UUID(uuidString: identifier) != nil else { return false }
+        if let altIRK = dict["alt_irk"] as? Data, altIRK.count != 16 { return false }
+        return true
+    }
+
+    private static func rememberPairingData(_ data: Data) {
+        guard !data.isEmpty, pairingDataIsValid(data) else { return }
+        pairingDataLock.lock()
+        cachedPairingData = data
+        pairingDataLock.unlock()
+    }
+
+    private static func lastCachedPairingData() -> Data? {
+        pairingDataLock.lock()
+        defer { pairingDataLock.unlock() }
+        return cachedPairingData
+    }
+
+    static func clearCachedPairingData() {
+        pairingDataLock.lock()
+        cachedPairingData = nil
+        pairingDataLock.unlock()
+        shared.clearVisiblePIN()
+    }
+
+    func clearVisiblePIN() {
+        pairingPIN = nil
+    }
+
+    static func cachePairingDataIfNeeded(at path: String) {
+        guard lastCachedPairingData() == nil,
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              pairingDataIsValid(data) else { return }
+        rememberPairingData(data)
+    }
+
+    /// Returns a validated pairing snapshot from disk, falling back to the last
+    /// known-good bytes captured during import or pairing completion.
+    /// The Export Pairing UI writes these bytes directly instead of reopening a
+    /// path that may have changed between the availability check and the tap.
+    static func pairingDataForExport(preferredPaths: [String] = []) -> Data? {
+        let fm = FileManager.default
+        let documents = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let canonical = documents.appendingPathComponent("erosion_pairing.plist")
+        var paths = preferredPaths
+        if let custom = customPairingFilePath { paths.append(custom) }
+        paths.append(canonical.path)
+        if let names = try? fm.contentsOfDirectory(atPath: documents.path) {
+            paths.append(contentsOf: names
+                .filter { $0.hasSuffix(".plist") || $0.hasSuffix(".mobilepairing") || $0.hasSuffix(".mobilepair") }
+                .map { documents.appendingPathComponent($0).path })
+        }
+
+        var seen = Set<String>()
+        for path in paths where seen.insert(path).inserted {
+            guard fm.fileExists(atPath: path),
+                  let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  pairingDataIsValid(data) else { continue }
+            rememberPairingData(data)
+            if path != canonical.path {
+                // Mirror to the stable app-owned path, but don't delete the source
+                // as part of an Export operation.
+                try? data.write(to: canonical, options: .atomic)
+                customPairingFilePath = canonical.path
+            }
+            return data
+        }
+        if let cached = lastCachedPairingData(), pairingDataIsValid(cached) {
+            return cached
+        }
+        return nil
     }
 
     /// Start the host and resolve with the pairing-file path, or throw.
@@ -258,20 +347,23 @@ final class PairingController: ObservableObject, @unchecked Sendable {
             self?.keepAlive.stopAll()
         }
         running = false
-        pairingPIN = nil
 
         switch outcome {
         case let .success(name, path):
             let canonical = Self.syncCanonicalPairingFile(from: path)
             let size = (try? FileManager.default.attributesOfItem(atPath: canonical)[.size] as? Int) ?? 0
             if size == 0 {
+                pairingPIN = nil
                 pairingStatus = "Failed: empty pairing file"
                 resolve(.failure(PairingError.zeroBytes))
             } else {
+                // Keep the visible PIN until Airlift switches to its paired toolbar
+                // item on the next state-presence refresh; prevents a transient "Pair" flash.
                 pairingStatus = "Paired: \(name) (\(size)B)"
                 resolve(.success(canonical))
             }
         case let .failure(message):
+            pairingPIN = nil
             pairingStatus = "Failed: \(message)"
             resolve(.failure(PairingError.failed(message)))
         }
