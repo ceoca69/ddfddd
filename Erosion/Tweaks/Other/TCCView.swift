@@ -119,24 +119,24 @@ final class TCCSession: ObservableObject {
         Self.customImageKeyPrefix + permission.rawValue
     }
 
-    func customImageData(for permission: TCCPermission) -> Data? {
+    fileprivate func customImageData(for permission: TCCPermission) -> Data? {
         UserDefaults.standard.data(forKey: customImageKey(for: permission))
     }
 
-    func hasCustomImage(for permission: TCCPermission) -> Bool {
+    fileprivate func hasCustomImage(for permission: TCCPermission) -> Bool {
         guard let data = customImageData(for: permission), UIImage(data: data) != nil else { return false }
         return true
     }
 
     /// Called when the user taps the displayed image and picks a replacement.
     /// The replacement is resized immediately and saved silently; no alert is shown.
-    func selectCustomImage(_ data: Data, for permission: TCCPermission) {
+    fileprivate func selectCustomImage(_ data: Data, for permission: TCCPermission) {
         guard let normalized = Self.normalized207PNG(data) else { return }
         UserDefaults.standard.set(normalized, forKey: customImageKey(for: permission))
         imageRevision &+= 1
     }
 
-    func applySelectedImage(using airlift: AirliftBridge, permission: TCCPermission) async -> Bool {
+    fileprivate func applySelectedImage(using airlift: AirliftBridge, permission: TCCPermission) async -> Bool {
         guard !isApplying, !isResetting,
               let imageData = customImageData(for: permission),
               let normalized = Self.normalized207PNG(imageData) else { return false }
@@ -166,7 +166,7 @@ final class TCCSession: ObservableObject {
         }
     }
 
-    func resetSelected(using airlift: AirliftBridge, permission: TCCPermission) async -> Bool {
+    fileprivate func resetSelected(using airlift: AirliftBridge, permission: TCCPermission) async -> Bool {
         guard !isApplying, !isResetting else { return false }
         isResetting = true
         defer { isResetting = false }
